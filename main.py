@@ -44,7 +44,9 @@ async def run_db(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
+# Sync database functions
 def _get_pending_now_sync():
+    """Fetch pending medications for current time window."""
     now = datetime.now()
     minutes = now.hour * 60 + now.minute
     today = now.date().isoformat()
@@ -72,6 +74,7 @@ def _get_pending_now_sync():
         return []
 
 def _mark_sent_sync(item_id):
+    """Mark medication as sent."""
     try:
         supabase.table("medication_history") \
             .update({"status": "sent"}) \
@@ -81,6 +84,7 @@ def _mark_sent_sync(item_id):
         logger.error(f"Error marking med {item_id} as sent: {e}")
 
 def _update_final_status_sync(unique_id, status):
+    """Update final status of medication (taken/missed)."""
     try:
         supabase.table("medication_history") \
             .update({"status": status}) \
@@ -90,14 +94,46 @@ def _update_final_status_sync(unique_id, status):
     except Exception as e:
         logger.error(f"Error updating status for {unique_id}: {e}")
 
+def _get_active_meds_sync():
+    """Fetch all active medications."""
+    return supabase.table("medications").select("*").eq("active", True).execute()
+
+def _get_history_for_med_sync(med_id, today):
+    """Get medication history for a specific medication and date."""
+    return supabase.table("medication_history") \
+        .select("*") \
+        .eq("medication_id", med_id) \
+        .eq("date", today) \
+        .execute()
+
+def _insert_records_sync(records):
+    """Insert medication history records."""
+    return supabase.table("medication_history").insert(records).execute()
+
+# Async wrappers
 async def get_pending_now():
+    """Async wrapper for getting pending medications."""
     return await run_db(_get_pending_now_sync)
 
 async def mark_sent(item_id):
+    """Async wrapper for marking medication as sent."""
     await run_db(_mark_sent_sync, item_id)
 
 async def update_final_status(unique_id, status):
+    """Async wrapper for updating final status."""
     await run_db(_update_final_status_sync, unique_id, status)
+
+async def get_active_meds():
+    """Async wrapper for getting active medications."""
+    return await run_db(_get_active_meds_sync)
+
+async def get_history_for_med(med_id, today):
+    """Async wrapper for getting medication history."""
+    return await run_db(_get_history_for_med_sync, med_id, today)
+
+async def insert_records(records):
+    """Async wrapper for inserting records."""
+    return await run_db(_insert_records_sync, records)
 
 # -------------------------
 # Schedule Generators
@@ -105,43 +141,29 @@ async def update_final_status(unique_id, status):
 async def generate_daily_schedule():
     """Generates medication history entries for the current day."""
     today = datetime.now().date().isoformat()
-    # logger.info(f"Checking schedules for {today}...") # Reduced log spam
 
     try:
         # 1. Fetch active medications
-        meds_res = await run_db(
-            lambda: supabase.table("medications").select("*").eq("active", True).execute()
-        )
+        meds_res = await get_active_meds()
         meds = meds_res.data or []
 
         if not meds:
             return
 
         for med in meds:
-            # 2. Check if history already exists for this med today
-            history_res = await run_db(
-                lambda: supabase.table("medication_history")
-                .select("id")
-                .eq("medication_id", med["id"])
-                .eq("date", today)
-                .execute()
-            )
-            
-            if history_res.data:
-                # Basic check: if count matches schedule count? 
-                # For now, if ANY history exists, we assume it's done. 
-                # Ideally we check per time slot, but that's heavier.
-                # Assuming "if data exists, we already processed this med" handles basic case.
-                # To handle "history deleted": if query returns empty, we recreate.
-                continue
+            # 2. Check existing history for this medication today
+            history_res = await get_history_for_med(med["id"], today)
+            existing_times = {h["scheduled_time"] for h in (history_res.data or [])}
 
-            # 3. Insert new records
+            # 3. Insert new records only for missing time slots
             new_records = []
-            
             times = med.get("times", [])
             minutes = med.get("times_minutes", [])
-            
+
             for t_str, t_min in zip(times, minutes):
+                if t_str in existing_times:
+                    continue  # Already exists, skip
+
                 uid = str(uuid.uuid4())
                 record = {
                     "unique_id": uid,
@@ -156,9 +178,7 @@ async def generate_daily_schedule():
                 new_records.append(record)
 
             if new_records:
-                await run_db(
-                    lambda: supabase.table("medication_history").insert(new_records).execute()
-                )
+                await insert_records(new_records)
                 logger.info(f"Generated {len(new_records)} entries for {med['name']}")
 
     except Exception as e:
@@ -168,6 +188,7 @@ async def generate_daily_schedule():
 # Telegram Helpers
 # -------------------------
 def get_keyboard(unique_id):
+    """Create inline keyboard for medication confirmation."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Tomei", callback_data=f"taken:{unique_id}"),
@@ -176,11 +197,12 @@ def get_keyboard(unique_id):
     ])
 
 async def send_alert(bot, item):
+    """Send medication alert to patient via Telegram."""
     try:
         telegram_id = item.get("patients", {}).get("telegram_id")
         if not telegram_id:
             logger.warning(f"No telegram_id for patient in item {item['id']}")
-            return
+            return False
 
         text = (
             "⏰ <b>Hora do seu remédio!</b>\n\n"
@@ -189,7 +211,7 @@ async def send_alert(bot, item):
             f"📌 Dose: {item['medications']['dosage']}\n"
             f"🕒 Horário: {item['scheduled_time']}"
         )
-        
+
         await bot.send_message(
             chat_id=telegram_id,
             text=text,
@@ -197,13 +219,16 @@ async def send_alert(bot, item):
             reply_markup=get_keyboard(item["unique_id"])
         )
         logger.info(f"Alert sent to {telegram_id} for medication {item['medications']['name']}")
+        return True
     except Exception as e:
         logger.error(f"Failed to send alert for item {item['id']}: {e}")
+        return False
 
 # -------------------------
 # Callback Handler
 # -------------------------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user response to medication alert."""
     query = update.callback_query
     await query.answer()
 
@@ -213,59 +238,70 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update_final_status(unique_id, status)
 
-        msg_status = "Tomado" if status == "taken" else "Não tomado"
+        msg_status = "✅ Tomado" if status == "taken" else "❌ Não tomado"
         await query.edit_message_text(
-            f"✅ Status registrado: {msg_status}"
+            f"{msg_status}\n\nStatus registrado com sucesso!"
         )
         logger.info(f"Status updated to {status} for {unique_id}")
 
     except Exception as e:
         logger.error(f"Error handling callback: {e}")
-        await query.edit_message_text("❌ Erro ao registrar status via callback.")
+        await query.edit_message_text("❌ Erro ao registrar status. Tente novamente.")
 
 # -------------------------
 # Scheduler
 # -------------------------
-async def scheduler(app: Application):
+async def scheduler(app: Application, stop_event: asyncio.Event):
+    """Main scheduler loop for checking and sending medication alerts."""
     logger.info("Scheduler started.")
-    
+
     # Run once at startup
     await generate_daily_schedule()
     last_schedule_check = datetime.now()
 
-    while True:
+    while not stop_event.is_set():
         try:
             now = datetime.now()
-            
-            # Periodically sync schedules (e.g., every 5 minutes)
+
+            # Periodically sync schedules (every 5 minutes)
             # This handles deletions or new additions dynamically
-            if (now - last_schedule_check).total_seconds() > 300: 
-                 logger.info("Running periodic schedule sync...")
-                 await generate_daily_schedule()
-                 last_schedule_check = now
+            if (now - last_schedule_check).total_seconds() > 300:
+                logger.info("Running periodic schedule sync...")
+                await generate_daily_schedule()
+                last_schedule_check = now
 
             # Check for pending medications
             meds = await get_pending_now()
-            
+
             if meds:
                 logger.info(f"Found {len(meds)} pending medications.")
 
             for m in meds:
-                await mark_sent(m["id"])
-                await send_alert(app.bot, m)
+                # Send alert first, then mark as sent only if successful
+                success = await send_alert(app.bot, m)
+                if success:
+                    await mark_sent(m["id"])
 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
 
-        # Wait for the next minute boundary
+        # Wait for the next minute boundary OR stop signal
         now = datetime.now()
         seconds_to_sleep = 60 - now.second
-        await asyncio.sleep(seconds_to_sleep)
+        
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=seconds_to_sleep)
+            break  # Stop signal received
+        except asyncio.TimeoutError:
+            pass  # Normal timeout, continue loop
+
+    logger.info("Scheduler stopped.")
 
 # -------------------------
 # Main
 # -------------------------
 async def main():
+    """Main application entry point."""
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -274,33 +310,47 @@ async def main():
 
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Initialize and start bot without blocking loop
+    # Initialize and start bot
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    
+
     logger.info("Bot started via polling.")
 
-    # Start scheduler in background
-    scheduler_task = asyncio.create_task(scheduler(app))
-
-    # Keep the main loop running until interrupt
+    # Create stop event for graceful shutdown
     stop_signal = asyncio.Event()
 
+    # Start scheduler in background
+    scheduler_task = asyncio.create_task(scheduler(app, stop_signal))
+
+    # Keep the main loop running until interrupt
     try:
         await stop_signal.wait()
-    except asyncio.CancelledError:
-        pass
-    except KeyboardInterrupt:
-        pass
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Received shutdown signal.")
+        stop_signal.set()
     finally:
         logger.info("Stopping bot...")
+        
+        # Wait for scheduler to finish gracefully
+        try:
+            await asyncio.wait_for(scheduler_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Scheduler did not stop gracefully, cancelling...")
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Stop bot components
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
+        logger.info("Bot stopped successfully.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        logger.info("Application terminated by user.")
