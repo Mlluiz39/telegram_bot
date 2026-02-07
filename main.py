@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from functools import partial
 
 from dotenv import load_dotenv
@@ -18,6 +18,10 @@ from telegram.ext import (
 # -------------------------
 # Configuration & Logging
 # -------------------------
+
+def get_brasilia_time():
+    """Get current time in Brasília timezone (UTC-3)."""
+    return datetime.now(timezone(timedelta(hours=-3)))
 load_dotenv()
 
 logging.basicConfig(
@@ -47,7 +51,7 @@ async def run_db(func, *args, **kwargs):
 # Sync database functions
 def _get_pending_now_sync():
     """Fetch pending medications for current time window."""
-    now = datetime.now()
+    now = get_brasilia_time()
     minutes = now.hour * 60 + now.minute
     today = now.date().isoformat()
 
@@ -140,7 +144,7 @@ async def insert_records(records):
 # -------------------------
 async def generate_daily_schedule():
     """Generates medication history entries for the current day."""
-    today = datetime.now().date().isoformat()
+    today = get_brasilia_time().date().isoformat()
 
     try:
         # 1. Fetch active medications
@@ -160,11 +164,19 @@ async def generate_daily_schedule():
             times = med.get("times", [])
             minutes = med.get("times_minutes", [])
 
-            for t_str, t_min in zip(times, minutes):
+            for t_str in times:
+                try:
+                    h, m = map(int, t_str.split(':'))
+                    t_min = h * 60 + m
+                except ValueError:
+                    continue  # Invalid time format
                 if t_str in existing_times:
                     continue  # Already exists, skip
 
-                uid = str(uuid.uuid4())
+                # Create deterministic ID to prevent duplicates
+                unique_str = f"{med['id']}_{today}_{t_str}"
+                uid = str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_str))
+                
                 record = {
                     "unique_id": uid,
                     "short_id": uid[:8],
@@ -257,11 +269,11 @@ async def scheduler(app: Application, stop_event: asyncio.Event):
 
     # Run once at startup
     await generate_daily_schedule()
-    last_schedule_check = datetime.now()
+    last_schedule_check = get_brasilia_time()
 
     while not stop_event.is_set():
         try:
-            now = datetime.now()
+            now = get_brasilia_time()
 
             # Periodically sync schedules (every 5 minutes)
             # This handles deletions or new additions dynamically
@@ -286,7 +298,7 @@ async def scheduler(app: Application, stop_event: asyncio.Event):
             logger.error(f"Scheduler error: {e}")
 
         # Wait for the next minute boundary OR stop signal
-        now = datetime.now()
+        now = get_brasilia_time()
         seconds_to_sleep = 60 - now.second
         
         try:

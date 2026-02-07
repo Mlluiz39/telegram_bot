@@ -1,9 +1,13 @@
 import os
 import uuid
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from supabase import create_client
+
+def get_brasilia_time():
+    """Get current time in Brasília timezone (UTC-3)."""
+    return datetime.now(timezone(timedelta(hours=-3)))
 
 load_dotenv()
 
@@ -13,7 +17,7 @@ supabase = create_client(
 )
 
 def run_debug():
-    today = datetime.now().date().isoformat()
+    today = get_brasilia_time().date().isoformat()
     print(f"Debug: Checking schedules for {today}...")
 
     try:
