@@ -13,6 +13,9 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     ContextTypes,
+    MessageHandler,
+    CommandHandler,
+    filters,
 )
 
 # -------------------------
@@ -139,6 +142,38 @@ async def insert_records(records):
     """Async wrapper for inserting records."""
     return await run_db(_insert_records_sync, records)
 
+def _get_patient_by_telegram_id_sync(telegram_id):
+    """Get patient by telegram_id."""
+    try:
+        res = supabase.table("patients").select("*").eq("telegram_id", str(telegram_id)).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.error(f"Error fetching patient: {e}")
+        return None
+
+def _create_pending_patient_sync(telegram_id, first_name, username):
+    """Create a new pending patient."""
+    try:
+        res = supabase.table("patients").insert({
+            "telegram_id": str(telegram_id),
+            "name": first_name or username or "Paciente",
+            "status": "pending",
+            "created_at": get_brasilia_time().isoformat()
+        }).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.error(f"Error creating pending patient: {e}")
+        return None
+
+# Async wrappers for patient operations
+async def get_patient_by_telegram_id(telegram_id):
+    """Async wrapper for getting patient by telegram_id."""
+    return await run_db(_get_patient_by_telegram_id_sync, telegram_id)
+
+async def create_pending_patient(telegram_id, first_name, username):
+    """Async wrapper for creating pending patient."""
+    return await run_db(_create_pending_patient_sync, telegram_id, first_name, username)
+
 # -------------------------
 # Schedule Generators
 # -------------------------
@@ -237,6 +272,89 @@ async def send_alert(bot, item):
         return False
 
 # -------------------------
+# Message Handlers
+# -------------------------
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command - register or welcome patient."""
+    user = update.effective_user
+    telegram_id = user.id
+    first_name = user.first_name
+    username = user.username
+    
+    try:
+        # Check if patient already exists
+        patient = await get_patient_by_telegram_id(telegram_id)
+        
+        if patient:
+            if patient.get("status") == "active":
+                await update.message.reply_text(
+                    f"👋 Olá, {patient['name']}!\n\n"
+                    f"✅ Você já está cadastrado no sistema.\n"
+                    f"💊 Você receberá alertas quando for hora de tomar seus remédios."
+                )
+            else:
+                await update.message.reply_text(
+                    f"👋 Olá, {first_name}!\n\n"
+                    f"⏳ Seu cadastro está pendente de aprovação.\n"
+                    f"📋 Entre em contato com o administrador para ativar sua conta."
+                )
+        else:
+            # Create new pending patient
+            new_patient = await create_pending_patient(telegram_id, first_name, username)
+            
+            if new_patient:
+                await update.message.reply_text(
+                    f"👋 Bem-vindo, {first_name}!\n\n"
+                    f"✅ Seu Telegram foi registrado no sistema.\n"
+                    f"⏳ Seu cadastro está pendente de aprovação.\n\n"
+                    f"📋 O administrador precisa:\n"
+                    f"1. Acessar o painel web\n"
+                    f"2. Ativar seu cadastro\n"
+                    f"3. Cadastrar seus medicamentos\n\n"
+                    f"💊 Após a ativação, você receberá alertas dos seus remédios!"
+                )
+                logger.info(f"New pending patient registered: {telegram_id} ({first_name})")
+            else:
+                await update.message.reply_text(
+                    "❌ Erro ao registrar. Tente novamente mais tarde."
+                )
+    except Exception as e:
+        logger.error(f"Error in handle_start: {e}")
+        await update.message.reply_text(
+            "❌ Ocorreu um erro. Por favor, tente novamente."
+        )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle any message - automatically register new patients."""
+    user = update.effective_user
+    telegram_id = user.id
+    
+    try:
+        # Check if patient already exists
+        patient = await get_patient_by_telegram_id(telegram_id)
+        
+        if not patient:
+            # Auto-register as pending
+            new_patient = await create_pending_patient(
+                telegram_id, 
+                user.first_name, 
+                user.username
+            )
+            
+            if new_patient:
+                await update.message.reply_text(
+                    f"👋 Olá, {user.first_name}!\n\n"
+                    f"✅ Seu Telegram foi registrado automaticamente.\n"
+                    f"⏳ Aguardando aprovação do administrador.\n\n"
+                    f"📱 Seu ID: `{telegram_id}`\n\n"
+                    f"💊 Após a ativação no painel web, você receberá os alertas!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                logger.info(f"Auto-registered patient: {telegram_id} ({user.first_name})")
+    except Exception as e:
+        logger.error(f"Error in handle_message: {e}")
+
+# -------------------------
 # Callback Handler
 # -------------------------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -320,6 +438,8 @@ async def main():
         .build()
     )
 
+    app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     # Initialize and start bot
